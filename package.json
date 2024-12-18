@@ -1,0 +1,23 @@
+{
+  "name": "flight",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@bufbuild/protobuf": "^2.2.3",
+    "@types/node": "^22.10.2",
+    "debug": "^4.4.0",
+    "protobufjs": "^7.4.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  },
+  "devDependencies": {
+    "ts-proto": "^2.6.0"
+  }
+}
