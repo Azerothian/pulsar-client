@@ -5,6 +5,7 @@ export default class AsyncTCPClient extends EventEmitter {
     private socket: net.Socket;
     private dataQueue: Buffer[] = [];
     private resolveQueue: ((data: Buffer) => void)[] = [];
+    private closing = false;
 
     connect = (host: string, port: number) => {
         this.socket = net.createConnection({ host, port });
@@ -20,12 +21,9 @@ export default class AsyncTCPClient extends EventEmitter {
         });
         this.socket.on("end", () => {
             console.log("end");
+            this.closing = true;
             this.emit("end")
-        })
-        // this.socket.connect({
-        //     host,
-        //     port,
-        // })
+        });
     }
 
     private handleIncomingData(data: Buffer) {
@@ -40,7 +38,7 @@ export default class AsyncTCPClient extends EventEmitter {
     }
 
     async *[Symbol.asyncIterator]() {
-        while (true) {
+        while (!this.closing) {
             const data = await new Promise<Buffer>((resolve) => {
                 if (this.dataQueue.length > 0) {
                     // Immediate resolve if there's already data

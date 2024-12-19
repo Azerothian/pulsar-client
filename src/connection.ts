@@ -1,12 +1,16 @@
-import AsyncTCPClient from "./async-tcp-client";
-import { BaseCommand, BaseCommandType, CommandProducer } from "./types/pulsar/PulsarApi";
+import AsyncTCPClient from "./tcp-client";
+import { BaseCommand, BaseCommandType, CommandLookupTopic, CommandLookupTopicResponse, CommandProducer } from "./types/pulsar/PulsarApi";
 import protobuf from "protobufjs";
-import path, { resolve } from "path";
+// import { crc32 } from "zlib";
+import crc32 from "fast-crc32c"
+// import path, { resolve } from "path";
 
 import debug from "debug";
 import { PulsarProducer } from "./producer";
+import { EventEmitter } from "stream";
 const logger =  {
-    debug: debug("pulsar::connection::debug")
+    debug: debug("pulsar::connection::debug"),
+    error: debug("pulsar::connection::error"),
 };
 
 
@@ -19,9 +23,52 @@ const HEADERSIZE = 8;
 const HDRCMDSIZE = 4;
 const HDRTOTALSIZE = 4;
 
-export class PulsarConnection {
-    private dataQueue: PulsarMessage[] = [];
-    private resolveQueue: ((data: PulsarMessage) => void)[] = [];
+type RequestInfo = {
+    rId: number,
+    command: any,
+    resolver: PromiseWithResolvers<any>,
+    timeout?: NodeJS.Timeout
+    resolved?: boolean
+}
+
+
+class UniqueIdMap<T> {
+    private requests: Map<number, T> = new Map();
+    private requestID = 1;
+    getNextId = () => {
+        // ... should never inf loop
+        while (this.requests.has(this.requestID)) {
+            this.requestID++;
+            if (this.requestID > Number.MAX_SAFE_INTEGER) {
+                this.requestID = 1;
+            }
+            if (!this.requests.has(this.requestID)) {
+                return this.requestID;
+            }
+        }
+    }
+    add = (rId: number, req: T) => {
+        this.requests.set(rId, req);
+    }
+
+    delete = (rId: number) => {
+        this.requests.delete(rId);
+    }
+    get = (rId: number) => {
+        return this.requests.get(rId);
+    }
+    length = () => {
+        return this.requests.size;
+    }
+    getMap = () => {
+        return this.requests;
+    }
+}
+
+
+export class PulsarConnection extends EventEmitter {
+    // private dataQueue: PulsarMessage[] = [];
+    // private resolveQueue: ((data: PulsarMessage) => void)[] = [];
 
     private tcpClient: AsyncTCPClient;
     private protob: protobuf.Root;
@@ -29,16 +76,27 @@ export class PulsarConnection {
 
     private maxMessageSize = 5242880;
     private msKeepAlivePeriod = 30 * 1000; // 30 seconds
+    private msRequestTimeout = 10000; // 10 seconds
     private keepAliveInterval: NodeJS.Timeout;
 
-    private requestID = 1;
-    private requests: {rId: number, command: any, resolver: PromiseWithResolvers<any> }[] = [];
-    
-    private producerIdx = 1;
-    private producers: Map<number, PulsarProducer> = new Map();
+    private requests: UniqueIdMap<RequestInfo> = new UniqueIdMap<RequestInfo>();
+    private producers: UniqueIdMap<PulsarProducer> = new UniqueIdMap<PulsarProducer>();
 
-    constructor() {
+    uri: URL;
+    constructor(uri: URL) {
+        super();
+        this.uri = uri;
         this.tcpClient = new AsyncTCPClient();
+        this.tcpClient.on("end", this.handleTCPClientEnd);
+    }
+    getTotalRequests = () => {
+        return this.requests.length();
+    }
+    
+
+    handleTCPClientEnd = () => {
+        clearInterval(this.keepAliveInterval);
+        this.emit("end");
     }
     sendKeepAlive = () => {
         this.send({
@@ -47,11 +105,9 @@ export class PulsarConnection {
         });
     }
     
-    connect = async(host: string, port: number) => {
-        this.protob = await protobuf.load(path
-            .resolve(__dirname, "../proto/PulsarApi.proto"));
+    connect = async() => {
         this.baseCommand = this.protob.lookupType("BaseCommand");
-        this.tcpClient.connect(host, port);
+        this.tcpClient.connect(this.uri.host, parseInt(this.uri.port || "6650"));
         this.tcpClient.once("ready", () => {
             const command: BaseCommand = {
                 type: BaseCommandType.CONNECT,
@@ -127,15 +183,18 @@ export class PulsarConnection {
                     // todo: kill connection if pong never received
                     break;
                 case BaseCommandType.CLOSE_PRODUCER:
+                    this.processProducerClose(command);
                     break;
                 case BaseCommandType.PRODUCER_SUCCESS:
                     this.processProducerSuccess(command);
-
                     break;
+                
+                case BaseCommandType.LOOKUP_RESPONSE:
+                    this.processLookupResponse(command);
                 case BaseCommandType.ERROR:
                     break;
                 default:
-                    this.handleIncomingData(command, payload);
+                    // this.handleIncomingData(command, payload);
                     break;
             }
 
@@ -144,36 +203,6 @@ export class PulsarConnection {
             packetData = undefined;
             largePayload = false;
             currentIndex = 0;
-        }
-    }
-
-    
-    private handleIncomingData(command: BaseCommand, payload: Buffer) {
-        const data = {
-            command,
-            payload
-        };
-        if (this.resolveQueue.length > 0) {
-            // Resolve the first pending promise with the data
-            const resolve = this.resolveQueue.shift()!;
-            resolve(data);
-        } else {
-            // Queue the data for future iteration
-            this.dataQueue.push(data);
-        }
-    }
-    async *[Symbol.asyncIterator]() {
-        while (true) {
-            const data = await new Promise<PulsarMessage>((resolve) => {
-                if (this.dataQueue.length > 0) {
-                    // Immediate resolve if there's already data
-                    resolve(this.dataQueue.shift()!);
-                } else {
-                    // Otherwise, queue the resolver
-                    this.resolveQueue.push(resolve);
-                }
-            });
-            yield data;
         }
     }
 
@@ -192,18 +221,67 @@ export class PulsarConnection {
         if (payload) {
             payload.copy(packet, HEADERSIZE + commandSize, 0, payload.length);
         }
+
         this.tcpClient.send(packet);
     }
 
+    // sendMessage = (command: BaseCommand, payload?: Buffer) => {
+    //     logger.debug("send", BaseCommandType[command.type]);
+    //     const commandData = Buffer.from(this.baseCommand.encode(command).finish());
+    //     const commandSize = commandData.byteLength;
+    //     let frameSize = 4 + commandSize;
+    //     if(payload) {
+    //         frameSize += payload.byteLength;
+    //     }
+    //     let packet = Buffer.allocUnsafe(frameSize + 4);
+    //     packet.writeUInt32BE(frameSize, 0);
+    //     packet.writeUInt32BE(commandSize, 4);
+    //     commandData.copy(packet, HEADERSIZE, 0, commandData.length)
+    //     if (payload) {
+    //         payload.copy(packet, HEADERSIZE + commandSize, 0, payload.length);
+    //     }
+
+    //     this.tcpClient.send(packet);
+    // }
+
+
     close = () => {
-        clearInterval(this.keepAliveInterval);
         this.tcpClient.close();
+        this.producers.getMap().forEach((producer) => {
+            producer.close();
+        });
+        this.requests.getMap().forEach((req) => {
+            clearTimeout(req.timeout);
+            req.resolver.reject(new Error("Connection closed"));
+        });
+    }
+    createRequest = (rId: number, command: any, resolver: PromiseWithResolvers<any>, hasTimeout = false, deleteOnSuccess = false): RequestInfo => {
+        const req: RequestInfo = {
+            rId,
+            command,
+            resolver,
+            timeout: hasTimeout ? setTimeout(() => {
+                // this is for if the command is an active component not a one off
+                if (deleteOnSuccess) {
+                    this.requests.delete(rId);
+                }
+                logger.error("Timeout", {
+                    commandType: BaseCommandType[command.type],
+                    command,
+                    rId,
+                });
+                if (!req.resolved) {
+                    req.resolved = true;
+                    req.resolver.reject(new Error(`Timeout waiting for response for ${BaseCommandType[command.type]} request ${rId}`));
+                }
+            }, this.msRequestTimeout) : undefined
+        };
+        this.requests.add(rId, req);
+        return req;
     }
     createProducer = (topic: string, producerName?: string): Promise<PulsarProducer> => {
-        // lookup and verifiy topic
-
-        const rId = this.requestID++;
-        const producerId = this.producerIdx++;
+        const rId = this.requests.getNextId();
+        const producerId = this.producers.getNextId();
 
         let pName = producerName || `producer-${producerId}`;
         const cmdProducer: CommandProducer = {
@@ -214,62 +292,70 @@ export class PulsarConnection {
             producerName: pName,
             userProvidedProducerName: !!producerName,
         };
-        const req = {
-            rId,
-            command: cmdProducer,
-            resolver: Promise.withResolvers<PulsarProducer>()
-        };
-        this.requests.push(req);
+        const req = this.createRequest(rId, cmdProducer, Promise.withResolvers<PulsarProducer>(), true, true);
         this.send({
             type: BaseCommandType.PRODUCER,
             producer: cmdProducer
         });
         return req.resolver.promise;
     }
+    sendProducer = (producer: PulsarProducer, sequenceId: number, payload: Buffer) => {
+        this.send({
+            type: BaseCommandType.SEND,
+            send: {
+                producerId: producer.producerId,
+                sequenceId: sequenceId,
+                numMessages: 1,
+            }
+        }, payload);
+    }
     private processProducerSuccess = (command: BaseCommand) => {
         const rId = command.producer.requestId;
-        const req = this.requests.find(r => r.rId === rId);
-        if (!req) {
+        const req = this.requests.get(rId);
+        clearTimeout(req?.timeout);
+        if (!req || req?.resolved) {
             return;
         }
         const producer = new PulsarProducer(this, command.producer);
+        producer.on("end", () => {
+            this.requests.delete(command.producer.requestId);
+            this.producers.delete(command.producer.producerId);
+        });
+        req.resolved = true;
         req.resolver.resolve(producer);
         return true;
     }
+    private processProducerClose = (command: BaseCommand) => {
+        const producer = this.producers.get(command.closeProducer.producerId);
+        if (producer) {
+            producer.close();
+        }
+    }
+
+    lookupTopic = async(topic: string, authoritative: boolean = false) : Promise<CommandLookupTopicResponse> => {
+        const rId = this.requests.getNextId();
+        const req = this.createRequest(rId, topic, Promise.withResolvers<CommandLookupTopicResponse>(), true, true);
+        this.requests.add(rId, req);
+        this.send({
+            type: BaseCommandType.LOOKUP,
+            lookupTopic: {
+                requestId: rId,
+                topic,
+                authoritative,
+                properties: [],
+                advertisedListenerName: undefined,
+            }
+        });
+        return req.resolver.promise;
+    }
+    private processLookupResponse = (command: BaseCommand) => {
+        const rId = command.lookupTopic.requestId;
+        const req = this.requests[rId];
+        if (!req) {
+            return;
+        }
+        req.resolver.resolve(command.lookupTopic);
+        this.requests.delete(rId);
+    }
 
 }
-
-
-// export class PulsarConnectionPool {
-//     private connections: PulsarConnection[] = [];
-//     private currentIndex = 0;
-//     constructor() {
-//         this.connections = [];
-//     }
-
-//     addConnection = (connection: PulsarConnection) => {
-//         this.connections.push(connection);
-//     }
-
-//     getConnection = () => {
-//         if (this.currentIndex >= this.connections.length) {
-//             this.currentIndex = 0;
-//         }
-//         return this.connections[this.currentIndex++];
-//     }
-// }
-
-
-
-
-// (async () => {
-//     const pulsar = new PulsarConnection();
-//     pulsar.connect('10.43.215.210', 6650);
-//     // do {
-//     //     await sleep(100);
-//     // } while(true)
-// })();
-
-// function sleep(ms = 100) {
-//     return new Promise((resolve) => setTimeout(resolve, ms));
-// }

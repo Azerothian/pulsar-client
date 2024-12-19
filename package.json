@@ -10,9 +10,9 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "@bufbuild/protobuf": "^2.2.3",
     "@types/node": "^22.10.2",
     "debug": "^4.4.0",
+    "fast-crc32c": "^2.0.0",
     "protobufjs": "^7.4.0",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2"
