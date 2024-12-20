@@ -1,13 +1,15 @@
-import AsyncTCPClient from "./tcp-client";
-import { BaseCommand, BaseCommandType, CommandLookupTopic, CommandLookupTopicResponse, CommandProducer } from "./types/pulsar/PulsarApi";
+import AsyncTCPClient from "./utils/tcp-client";
+import { BaseCommand, BaseCommandType, CommandCloseProducer, CommandLookupTopic, CommandLookupTopicResponse, CommandProducer, CommandSend, CommandSendReceipt, CommandSuccess, MessageMetadata } from "./types/pulsar/PulsarApi";
 import protobuf from "protobufjs";
-// import { crc32 } from "zlib";
 import crc32 from "fast-crc32c"
 // import path, { resolve } from "path";
 
 import debug from "debug";
 import { PulsarProducer } from "./producer";
 import { EventEmitter } from "stream";
+import { createWriteStream } from "fs";
+import { deflateAsync } from "./utils/zlib";
+import PulsarClient from ".";
 const logger =  {
     debug: debug("pulsar::connection::debug"),
     error: debug("pulsar::connection::error"),
@@ -22,6 +24,9 @@ export type PulsarMessage = {
 const HEADERSIZE = 8;
 const HDRCMDSIZE = 4;
 const HDRTOTALSIZE = 4;
+
+const magicCrc32c = 0x0e01;
+const magicBrokerEntryMetadata = 0x0e02;
 
 type RequestInfo = {
     rId: number,
@@ -67,12 +72,8 @@ class UniqueIdMap<T> {
 
 
 export class PulsarConnection extends EventEmitter {
-    // private dataQueue: PulsarMessage[] = [];
-    // private resolveQueue: ((data: PulsarMessage) => void)[] = [];
-
     private tcpClient: AsyncTCPClient;
-    private protob: protobuf.Root;
-    private baseCommand: protobuf.Type;
+    // private baseCommand: protobuf.Type;
 
     private maxMessageSize = 5242880;
     private msKeepAlivePeriod = 30 * 1000; // 30 seconds
@@ -81,11 +82,13 @@ export class PulsarConnection extends EventEmitter {
 
     private requests: UniqueIdMap<RequestInfo> = new UniqueIdMap<RequestInfo>();
     private producers: UniqueIdMap<PulsarProducer> = new UniqueIdMap<PulsarProducer>();
-
-    uri: URL;
-    constructor(uri: URL) {
+    private pulsarClient: PulsarClient;
+    private sequenceId = 0;
+    private uri: URL;
+    constructor(uri: URL, pulsarClient: PulsarClient) {
         super();
         this.uri = uri;
+        this.pulsarClient = pulsarClient;
         this.tcpClient = new AsyncTCPClient();
         this.tcpClient.on("end", this.handleTCPClientEnd);
     }
@@ -106,8 +109,8 @@ export class PulsarConnection extends EventEmitter {
     }
     
     connect = async() => {
-        this.baseCommand = this.protob.lookupType("BaseCommand");
-        this.tcpClient.connect(this.uri.host, parseInt(this.uri.port || "6650"));
+
+        this.tcpClient.connect(this.uri.hostname, parseInt(this.uri.port || "6650"));
         this.tcpClient.once("ready", () => {
             const command: BaseCommand = {
                 type: BaseCommandType.CONNECT,
@@ -156,7 +159,7 @@ export class PulsarConnection extends EventEmitter {
             }
 
             const commandData = Buffer.copyBytesFrom(packetData, HEADERSIZE, commandSize);
-            const command = this.baseCommand.decode(commandData) as unknown as BaseCommand;
+            const command = this.pulsarClient.getProtobType("BaseCommand").decode(commandData) as unknown as BaseCommand;
             logger.debug("received", BaseCommandType[command.type]);
 
             let payload: Buffer = undefined
@@ -193,6 +196,8 @@ export class PulsarConnection extends EventEmitter {
                     this.processLookupResponse(command);
                 case BaseCommandType.ERROR:
                     break;
+                case BaseCommandType.SUCCESS:
+                    this.processSuccessResponse(command);
                 default:
                     // this.handleIncomingData(command, payload);
                     break;
@@ -205,29 +210,10 @@ export class PulsarConnection extends EventEmitter {
             currentIndex = 0;
         }
     }
-
-    send = (command: BaseCommand, payload?: Buffer) => {
-        logger.debug("send", BaseCommandType[command.type]);
-        const commandData = Buffer.from(this.baseCommand.encode(command).finish());
-        const commandSize = commandData.byteLength;
-        let frameSize = 4 + commandSize;
-        if(payload) {
-            frameSize += payload.byteLength;
-        }
-        let packet = Buffer.allocUnsafe(frameSize + 4);
-        packet.writeUInt32BE(frameSize, 0);
-        packet.writeUInt32BE(commandSize, 4);
-        commandData.copy(packet, HEADERSIZE, 0, commandData.length)
-        if (payload) {
-            payload.copy(packet, HEADERSIZE + commandSize, 0, payload.length);
-        }
-
-        this.tcpClient.send(packet);
-    }
-
-    // sendMessage = (command: BaseCommand, payload?: Buffer) => {
+    // [TOTAL_SIZE] [CMD_SIZE][CMD]
+    // send = (command: BaseCommand, payload?: Buffer) => {
     //     logger.debug("send", BaseCommandType[command.type]);
-    //     const commandData = Buffer.from(this.baseCommand.encode(command).finish());
+    //     const commandData = Buffer.from(this.pulsarClient.getProtobType("BaseCommand").encode(command).finish());
     //     const commandSize = commandData.byteLength;
     //     let frameSize = 4 + commandSize;
     //     if(payload) {
@@ -243,19 +229,107 @@ export class PulsarConnection extends EventEmitter {
 
     //     this.tcpClient.send(packet);
     // }
+    // Wire format
+	// [TOTAL_SIZE] [CMD_SIZE][CMD] // [MAGIC_NUMBER][CHECKSUM] [METADATA_SIZE][METADATA] [PAYLOAD]
+    send = async(command: BaseCommand, payload?: Buffer, metadataMessage?: MessageMetadata, doCompress = false) => {
+        // const ws = createWriteStream()
+        logger.debug("send", BaseCommandType[command.type]);
+        const hasPayload = payload && payload.byteLength > 0 && metadataMessage;
+        let frameSize = 4; // command size (do not include frame header size)
+        const commandData = Buffer.from(this.pulsarClient.getProtobType("BaseCommand").encode(command).finish());
+        frameSize += commandData.byteLength;;
+        let processedPayload, metadataSize, metadata;
+        if (hasPayload) {
+            frameSize += 4; // MAGIC_NUMBER
+            frameSize += 4; // CHECKSUM
+            frameSize += 4; // METADATA_SIZE
+
+            metadata = Buffer.from(this.pulsarClient.getProtobType("MessageMetadata").encode(metadataMessage).finish());
+            metadataSize = metadata.byteLength;
+            frameSize += metadataSize;
+
+            let processedPayload = payload;
+            if (doCompress) {
+                processedPayload = await deflateAsync(payload);
+            }
+
+            // TODO: encrypt payload ?
+            frameSize += processedPayload.byteLength; // Remaining size
 
 
-    close = () => {
+        }
+        const packet = Buffer.allocUnsafe(frameSize + 4); // frame size does not include the frame size itself
+        packet.writeUInt32BE(frameSize, 0); // total size
+        packet.writeUInt32BE(commandData.byteLength, 4); // command size
+        commandData.copy(packet, HEADERSIZE, 0, commandData.length); // command
+
+        if (hasPayload) {
+            const crcBufferSize = 4 + metadataSize + processedPayload.byteLength;
+            
+            const crcBuffer = Buffer.allocUnsafe(crcBufferSize);
+            crcBuffer.writeUInt32BE(metadataSize, 0);
+            metadata.copy(crcBuffer, 4, 0, metadataSize);
+            processedPayload.copy(crcBuffer, 4 + metadataSize, 0, processedPayload.byteLength);
+            const crc = crc32.calculate(crcBuffer);
+
+            packet.writeUInt32BE(magicCrc32c, HEADERSIZE + commandData.length); // magic number for Crc32c
+            packet.writeUInt32BE(crc, HEADERSIZE + commandData.length + 4); // crc
+            packet.writeUInt32BE(metadataSize, HEADERSIZE + commandData.length + 8); // metadata size
+            metadata.copy(packet, HEADERSIZE + commandData.length + 12, 0, metadataSize); // metadata
+            processedPayload.copy(packet, HEADERSIZE + commandData.length + 12 + metadataSize, 0, processedPayload.byteLength); // payload
+        }
+        return this.tcpClient.send(packet);
+    }
+    sendMessage = async(payload: Buffer, producer: PulsarProducer, waitForReceipt = false) : Promise<CommandSendReceipt | undefined> => {
+        logger.debug("send message");
+        const rId = this.requests.getNextId();
+        const sequenceId = this.sequenceId++;
+        const cmdSend: CommandSend = {
+            producerId: producer.producerId,
+            sequenceId: sequenceId,
+            numMessages: 1,
+        };
+
+        const metadataMessage: MessageMetadata = {
+            producerName: producer.producerName,
+            sequenceId: sequenceId,
+            // numMessagesInBatch: 1,
+            uncompressedSize: payload.byteLength,
+            // partitionKey: "",
+            properties: [],
+            // eventTime: 0,
+            // partitionKeyB64Encoded: false,
+            // replicatedFrom: "",
+            publishTime: Date.now(),
+            replicateTo: [],
+            encryptionKeys: [],
+        };
+        const req = this.createRequest(rId, cmdSend, Promise.withResolvers<any>(), true, true);
+        this.send({
+            type: BaseCommandType.SEND,
+            send: cmdSend
+        }, payload, metadataMessage, true);
+        if (waitForReceipt) {
+            return req.resolver.promise
+        }
+        return undefined;
+    }
+
+
+    close = async() => {
+        logger.debug("close");
         this.tcpClient.close();
-        this.producers.getMap().forEach((producer) => {
-            producer.close();
-        });
+        await Promise.all(this.producers.getMap().values().map((producer) => {
+            return producer.close(true);
+        }));
         this.requests.getMap().forEach((req) => {
             clearTimeout(req.timeout);
             req.resolver.reject(new Error("Connection closed"));
         });
     }
+
     createRequest = (rId: number, command: any, resolver: PromiseWithResolvers<any>, hasTimeout = false, deleteOnSuccess = false): RequestInfo => {
+        logger.debug("createRequest", command);
         const req: RequestInfo = {
             rId,
             command,
@@ -279,7 +353,8 @@ export class PulsarConnection extends EventEmitter {
         this.requests.add(rId, req);
         return req;
     }
-    createProducer = (topic: string, producerName?: string): Promise<PulsarProducer> => {
+    createProducer = async (topic: string, producerName?: string): Promise<PulsarProducer> => {
+        logger.debug("createProducer", topic, producerName);
         const rId = this.requests.getNextId();
         const producerId = this.producers.getNextId();
 
@@ -293,23 +368,34 @@ export class PulsarConnection extends EventEmitter {
             userProvidedProducerName: !!producerName,
         };
         const req = this.createRequest(rId, cmdProducer, Promise.withResolvers<PulsarProducer>(), true, true);
-        this.send({
+        await this.send({
             type: BaseCommandType.PRODUCER,
             producer: cmdProducer
         });
         return req.resolver.promise;
     }
-    sendProducer = (producer: PulsarProducer, sequenceId: number, payload: Buffer) => {
-        this.send({
-            type: BaseCommandType.SEND,
-            send: {
-                producerId: producer.producerId,
-                sequenceId: sequenceId,
-                numMessages: 1,
-            }
-        }, payload);
+    closeProducer = async(producer: PulsarProducer) => {
+        logger.debug("closeProducer", producer);
+        const rId = this.requests.getNextId(); 
+        const cmdCloseProducer: CommandCloseProducer = {
+            producerId: producer.producerId,
+            requestId: rId,
+        };
+        const req = this.createRequest(rId, cmdCloseProducer, Promise.withResolvers<CommandSuccess>(), true, true);
+        await this.send({
+            type: BaseCommandType.CLOSE_PRODUCER,
+            closeProducer: cmdCloseProducer,
+        });
+        return req.resolver.promise;
     }
+
+    private processSuccessResponse = (command: BaseCommand) => {
+        logger.debug("processSuccessResponse", BaseCommandType[command.type]);
+        this.resolveRequest(command.success.requestId, command.success);
+    }
+
     private processProducerSuccess = (command: BaseCommand) => {
+        logger.debug("processProducerSuccess", command);
         const rId = command.producer.requestId;
         const req = this.requests.get(rId);
         clearTimeout(req?.timeout);
@@ -326,13 +412,15 @@ export class PulsarConnection extends EventEmitter {
         return true;
     }
     private processProducerClose = (command: BaseCommand) => {
+        logger.debug("processProducerClose", command);
         const producer = this.producers.get(command.closeProducer.producerId);
         if (producer) {
-            producer.close();
+            producer.close(true);
         }
     }
 
     lookupTopic = async(topic: string, authoritative: boolean = false) : Promise<CommandLookupTopicResponse> => {
+        logger.debug("lookupTopic", topic, authoritative);
         const rId = this.requests.getNextId();
         const req = this.createRequest(rId, topic, Promise.withResolvers<CommandLookupTopicResponse>(), true, true);
         this.requests.add(rId, req);
@@ -349,12 +437,16 @@ export class PulsarConnection extends EventEmitter {
         return req.resolver.promise;
     }
     private processLookupResponse = (command: BaseCommand) => {
-        const rId = command.lookupTopic.requestId;
+        logger.debug("processLookupResponse", command);
+        this.resolveRequest(command.lookupTopicResponse.requestId, command.lookupTopicResponse);
+        
+    }
+    private resolveRequest = (rId: number, command: any) => {
         const req = this.requests[rId];
         if (!req) {
             return;
         }
-        req.resolver.resolve(command.lookupTopic);
+        req.resolver.resolve(command);
         this.requests.delete(rId);
     }
 

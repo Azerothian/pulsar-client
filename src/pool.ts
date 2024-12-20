@@ -1,3 +1,4 @@
+import PulsarClient from ".";
 import { PulsarConnection } from "./connection";
 
 export class PulsarConnectionPool {
@@ -5,11 +6,13 @@ export class PulsarConnectionPool {
     maxActiveRequests = 500;
     maxConnections = 20;
     uri: URL;
-    constructor(uri: URL, maxActiveRequests = 500, maxConnections = 20) {
+    pulsarClient: PulsarClient;
+    constructor(uri: URL, pulsarClient: PulsarClient, maxActiveRequests = 500, maxConnections = 20) {
         this.uri = uri;
         this.connections = [];
         this.maxConnections = maxConnections;
         this.maxActiveRequests = maxActiveRequests;
+        this.pulsarClient = pulsarClient;
     }
     get = async() => {
         let connection = this.connections
@@ -20,7 +23,7 @@ export class PulsarConnectionPool {
             if (this.connections.length >= this.maxConnections) {
                 throw new Error("Max connections reached with max active requests");
             }
-            connection = new PulsarConnection(this.uri);
+            connection = new PulsarConnection(this.uri, this.pulsarClient);
             connection.on("end", () => {
                 this.connections = this.connections.filter(c => c !== connection);
             });

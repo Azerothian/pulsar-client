@@ -1,6 +1,7 @@
-import { PulsarConnection } from "./connection"
+import path from "path";
 import { PulsarConnectionPool } from "./pool";
-import { CommandAckAckType, CommandLookupTopic, CommandLookupTopicResponseLookupType, CommandProducer } from "./types/pulsar/PulsarApi";
+import protobuf from "protobufjs";
+import { CommandLookupTopicResponseLookupType } from "./types/pulsar/PulsarApi";
 // function reqId() {
 //     return 'xxxyxxxx'.replace(/[xy]/g, function(c) {
 //         var r = Math.random() * 16 | 0, v = c == 'x' ? r : (r & 0x3 | 0x8);
@@ -14,14 +15,27 @@ import { CommandAckAckType, CommandLookupTopic, CommandLookupTopicResponseLookup
 
 
 export default class PulsarClient {
-    uri: URL;
-
-    pools: Map<URL, PulsarConnectionPool> = new Map();
+    private uri: URL;
+    private protob: protobuf.Root;
+    private protobIndex: { [key: string]: protobuf.Type } = {};
+    private pools: Map<URL, PulsarConnectionPool> = new Map();
     constructor() {
     }
-    initialise = (uri: string) => {
+    initialise = async(uri: string) => {
         this.uri = new URL(uri);
+        this.protob = await protobuf.load(path.resolve(__dirname, "../proto/PulsarApi.proto"));
     }
+    getProtobType = (type: string) => {
+        let protobType = this.protobIndex[type];
+        if (!protobType) {
+            protobType = this.protob.lookupType(type);
+            this.protobIndex[type] = protobType;
+        }
+        return protobType;
+    }
+    // getProtob = () => {
+    //     return this.protob;
+    // }
     lookupTopic = async(topic: string, uri: URL = this.uri, authoritative = false) => {
         const connection = await this.getConnectionPool(uri).get();
         const lookupTopic = await connection.lookupTopic(topic, authoritative);
@@ -52,7 +66,7 @@ export default class PulsarClient {
         }
         let pool = this.pools.get(uri);
         if (!pool) {
-            pool = new PulsarConnectionPool(uri);
+            pool = new PulsarConnectionPool(uri, this);
             this.pools.set(uri, pool);
         }
         return pool;

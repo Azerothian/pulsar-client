@@ -11,11 +11,12 @@
             "skipFiles": [
                 "<node_internals>/**"
             ],
-            "program": "${workspaceFolder}/src/index.ts",
+            "program": "${workspaceFolder}/src/test.ts",
             "outFiles": [
                 "${workspaceFolder}/**/*.js"
             ],
-            "runtimeExecutable": "${workspaceFolder}/node_modules/.bin/tsx"
+            "runtimeExecutable": "${workspaceFolder}/node_modules/.bin/tsx",
+            "console": "integratedTerminal"
         }
     ]
 }

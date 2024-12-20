@@ -19,13 +19,20 @@ export class PulsarProducer extends EventEmitter {
         this.producerName = commandProducer.producerName;
         this.producerId = commandProducer.producerId;
     }
-    send = async(message: Buffer, waitForAck = false) => {
-        
+    send = async(message: Buffer, waitForReceipt = false) => {
+        return this.connection.sendMessage(message, this, waitForReceipt);
     }
-    close = () => {
+    close = async (remote?: boolean) => {
         // close producer
-        this.closed = true;
-        this.emit("end");
+        if (!remote) {
+            // send close producer command
+           await this.connection.closeProducer(this);
+        }
+        if (!this.closed) {
+            this.closed = true;
+            this.emit("end");
+        }
+        
     }
     
     // async *[Symbol.asyncIterator]() {
